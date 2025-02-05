@@ -1,0 +1,475 @@
+---
+title: "NoSleep2024"
+author: "Rosemary Pang"
+format: 
+  html: 
+    embed-resources: true
+    self-contained-math: true
+---
+
+Happy Halloween! This is the Halloween special for Text as Data course. In this project, I scrape the NoSleep subreddit and analyze horrow stories people shared.
+
+```{r}
+library(rvest)
+library(stringi)
+library(stringr)
+library(dplyr)
+library(stm)
+library(tidyverse)
+library(quanteda)
+library(quanteda.dictionaries)
+library(quanteda.sentiment)
+library(quanteda.textplots)
+library(ggplot2)
+library(wordcloud)
+library(data.table)
+library(text2vec)
+library(cleanNLP)
+```
+
+# Getting Data Ready
+
+This section includes data cleaning and preprocessing. After reading in the data, I found some stories have more than one part, which is marked as \[Part 1\], \[Part 2\], etc. So I delete these before preprocessing.
+
+```{r}
+NoSleep <- read_csv("NoSleep.csv") %>%
+  select(-1)
+head(NoSleep)
+#Delete \n\n for paragraph changing
+NoSleep$text_clean <- NoSleep$text %>%
+  str_replace_all("\n\n", " ") %>%
+  str_replace_all("\n", " ") %>%
+  str_replace_all("\\*", "") %>%
+  str_replace_all("\\[.*?\\]", "") #Delete [Part 1][Part 2]
+
+#Double checking: if there's no space between a period and a word, we add a space
+NoSleep$text_clean <- gsub("([[:punct:]])(?=[A-Z])", "\\1 ", NoSleep$text_clean, perl = TRUE)
+
+NoSleep$text_clean[1]
+NoSleep$text_clean[5]
+```
+
+```{r}
+#We first need to clean the text. For example, some authors use \n\n to separate paragraphs, which is not showing in the text. Causing "fetish.He" etc. So first I want to add a space in between.
+#NoSleep$cleaned_text <- gsub("([[:punct:]])(?=[A-Z])", "\\1 ", NoSleep$text, perl = TRUE)
+#double-check
+#writeLines(NoSleep$cleaned_text[1])
+```
+
+We only look into the main content of the stories. Now for data pre-processing: change into corpus, tokenization, remove punctuation, numbers, symbols, url, stopwords, to lower case, and lemmatize.
+
+```{r}
+story_corpus <- corpus(NoSleep$text_clean)
+# Removing apostrophes before tokenization
+story_corpus <- gsub("'", "", story_corpus)
+
+story_token <- tokens(story_corpus,
+                   remove_punct = T,
+                   remove_symbols = T,
+                   remove_numbers = T,
+                   remove_url = T,
+                   split_hyphens = F,
+                   include_docvars = T) %>%
+  tokens_tolower()
+
+# remove stopwords
+story_token <- tokens_select(story_token,                 pattern=c(stopwords("en"),"t","s","re","im",                     "wasnt","didnt"),
+                  selection="remove")
+
+# lemmatization (I may not use this version)
+story_token_lem <- tokens_replace(story_token,
+                                  pattern=lexicon::hash_lemmas$token,
+                                  replacement = lexicon:: hash_lemmas$lemma)
+
+# create document feature matrix
+storyDfm <- story_token_lem %>%
+                   dfm()
+storyDfm
+topfeatures(storyDfm,50)
+```
+
+We see that the top features are not horrifying at all... So simply making a word cloud may not be very helpful.
+
+# Find the Monsters
+
+What are those THINGS that scares people? We first develop a list of seed words, such as vampires, werewolves, ghosts, skeletons, etc, then use pre-trained **GloVe** to find words similar to the seed words.
+
+```{r}
+GloVe <- fread("glove.6B.50d.txt", header = FALSE, sep = " ", quote = "")
+GloVe <- as.data.frame(GloVe)
+GloVe[1:6,1:6]
+#change the first column as row names
+rownames(GloVe) <- GloVe[[1]]
+GloVe <- GloVe[, -1]
+GloVe[1:6,1:6]
+```
+
+Now we have calculated the GloVe for the tokens. Let's move on to compare cosine similarity using the list of seed words.
+
+```{r}
+# Change GloVe into a matrix as sim2() function expects x and y to be matrices
+GloVe <- as.matrix(GloVe)
+
+# List of seed words
+seed_words <- c("vampire", "werewolf", "zombie", "ghost",  "witch", "goblin", "demon", "skeleton", "clown")
+
+# Initialize an empty list to store the results
+similar_words <- list()
+
+# Loop through each seed word
+for (seed in seed_words) {
+  # Check if the seed word exists in word_vectors
+  if (seed %in% rownames(GloVe)) {
+    # Get the vector for the seed word
+    word_vec <- GloVe[seed, , drop = FALSE]
+    
+    # Calculate cosine similarity
+    sim <- sim2(x = GloVe, y = word_vec, method = "cosine", norm = "l2")
+    
+    # Sort the results and get the top 10 most similar words
+    top_similar <- head(sort(sim[, 1], decreasing = TRUE), 20)
+    
+    # Store the results in the list
+    similar_words[[seed]] <- top_similar
+  } else {
+    # If the word is not found, print a message
+    print(paste(seed, "not found in GloVe."))
+  }
+}
+
+# Output the results for each seed word
+for (seed in seed_words) {
+  if (!is.null(similar_words[[seed]])) {
+    cat("\nTop words similar to:", seed, "\n")
+    print(similar_words[[seed]])
+  }
+}
+```
+
+WOW, that's a long list of scary creatures, and we see lots of overlapping. Let's see what are the unique words and narrow them down to horror-story related ones.
+
+```{r}
+unique_words <- unique(unlist(lapply(similar_words, names)))
+
+unique_words
+```
+
+Now we have our list: vampire, werewolf, beast, witch, zombie, ghost, demon, monster, killer, stranger, goblin, hobgoblin, rakshasa, ogre, wraith, wizard, lucifer, skeleton, skull, clown, and doll.
+
+We want to know what are the top scary things appear in the stories.
+
+```{r}
+# Convert fullDfm into data frame
+full_df <- convert(storyDfm,to="data.frame")
+
+# Things you see
+things <- c("vampire", "werewolf", "beast", "witch", "zombie", "ghost", "demon", "monster", "killer", "stranger", "goblin", "hobgoblin", "rakshasa", "ogre", "wraith", "wizard", "lucifer", "skeleton", "skull", "clown", "doll")
+
+# Filter 'things' to only include words that appear in the corpus (columns in full_df)
+existing_things <- things[things %in% colnames(full_df)]
+
+full_things <- full_df[,existing_things]
+
+full_things2 <- as.data.frame(t(full_things)) 
+
+full_things2 <- full_things2 %>% 
+  mutate(count = rowSums(.))
+
+full_things2 <- tibble::rownames_to_column(full_things2, "things")
+
+top_things <- head(full_things2 %>% arrange(desc(count)),10)
+
+top_things <- top_things %>% 
+  mutate(things = reorder(things, -count))
+
+
+ggplot(top_things, aes(x=things, y=count)) +
+  geom_bar(stat="identity")
+```
+
+# Words Co-Occur with the top-10 Monsters
+
+Now that we have found the top-10 Monsters. Let's check out the co-occurrence matrix of these THINGS. This will give us more information, for example, where they are, what they look like, when they appear...
+
+```{r}
+ten_things <- as.character(top_things$things)
+
+# Loop through each "thing" to create co-occurrence matrices
+even_smaller_fcm_list <- list()
+
+for (i in ten_things) {
+  # Select tokens that contain each "thing" and its surrounding words
+  context <- tokens_select(story_token_lem, pattern = i, window = 10, selection = "keep")
+  # Create a feature co-occurrence matrix (FCM)
+  fcm_matrix <- fcm(context, context = "window")
+  # pull the top features
+  top_features <- names(sort(colSums(fcm_matrix), decreasing = TRUE)[1:30]) 
+  even_smaller_fcm <- fcm_select(fcm_matrix, pattern = c(i, top_features))
+  
+  #store it
+  even_smaller_fcm_list[[i]] <- even_smaller_fcm
+}
+```
+
+Now we make the network graphs for co-occurrence
+
+```{r}
+textplot_network(even_smaller_fcm_list[[1]])
+textplot_network(even_smaller_fcm_list[[2]])
+textplot_network(even_smaller_fcm_list[[3]])
+textplot_network(even_smaller_fcm_list[[4]])
+textplot_network(even_smaller_fcm_list[[5]])
+textplot_network(even_smaller_fcm_list[[6]])
+textplot_network(even_smaller_fcm_list[[7]])
+textplot_network(even_smaller_fcm_list[[8]])
+textplot_network(even_smaller_fcm_list[[9]])
+textplot_network(even_smaller_fcm_list[[10]])
+```
+
+# What those THINGS do?
+
+Now we want to find the top verbs that follow after the THINGS. We first reshape the corpus to sentence level, and only look into sentences with THINGS.
+
+```{r}
+#first reshape to sentence level
+sentence_corpus <- corpus_reshape(story_corpus, to="sentences")
+text_sentence <- as.character(sentence_corpus)
+
+# Create a regex pattern to match any word in the 'things' list
+pattern <- paste(things, collapse = "|")
+
+# Filter sentences to only those containing any of the words in 'things'
+things_sentences <- text_sentence[grepl(pattern, text_sentence, ignore.case = TRUE)]
+things_sentences[1:6]
+length(things_sentences)
+```
+
+Now we annotate the sentences.
+
+```{r}
+cnlp_init_udpipe()
+#Annotate POS
+annotated <- cnlp_annotate(things_sentences)
+head(annotated$token)
+```
+
+Find verbs after the THINGS. We first join the source and token.
+
+```{r}
+tokens <- annotated$token
+# Filter tokens to find verbs that follow any of the "things"
+joined_POS <- annotated$token %>%
+  left_join(
+    annotated$token,
+    by = c("doc_id" = "doc_id", "sid" = "sid", "tid" = "tid_source"),  # Shift `tid` for next token
+    suffix = c("", "_next")
+  ) %>%
+  filter(lemma %in% things) %>%          # Filter rows where the token is a "thing"
+  filter(upos_next == "VERB") 
+
+head(joined_POS)
+```
+
+Now we can filter unique verbs and make a bar plot.
+
+```{r}
+verb_counts <- joined_POS %>%
+  select(verb = lemma_next) %>%          # Select the following verb
+  count(verb, sort = TRUE) %>%           # Count occurrences of each verb
+  as.data.frame()      
+
+verb_counts <- verb_counts %>% 
+  mutate(verb = reorder(verb, -n))
+
+top_verb <- verb_counts[1:15,]
+
+ggplot(top_verb, aes(x=verb, y=n)) +
+  geom_bar(stat="identity")+
+  labs(x="Verbs",y="Count")
+```
+
+# Words to Describe Things
+
+Now that we find the actions of THINGS. Then what are the adjectives story tellers use to describe those THINGS?
+
+```{r}
+joined_POS_adj <- annotated$token %>%
+  # Join with itself to access the adjectives (source tokens) for each "thing"
+  left_join(
+    annotated$token,
+    by = c("doc_id" = "doc_id", "sid" = "sid", "tid" = "tid_source"),
+    suffix = c("", "_source")
+  ) %>%
+  # Filter for rows where the token is in "things" and the modifier is an adjective
+  filter(lemma %in% things) %>%            # Filter rows where the token is a "thing"
+  filter(relation_source == "amod" & upos_source == "ADJ")     
+
+head(joined_POS_adj)
+```
+
+```{r}
+adj_counts <- joined_POS_adj %>%
+  select(adj = lemma_source) %>%          # Select the previous adj
+  count(adj, sort = TRUE) %>%           # Count occurrences of each verb
+  as.data.frame()      
+
+adj_counts <- adj_counts %>% 
+  mutate(adj = reorder(adj, -n))
+
+top_adj <- adj_counts[1:15,]
+
+ggplot(top_adj, aes(x=adj, y=n)) +
+  geom_bar(stat="identity")+
+  labs(x="Adjectives",y="Count")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+Hmm... some of the adjectives doesn't make sense. Why there's serial? Why "human" is an adjective for stary things? Let's figure out.
+
+```{r}
+adj_thing_pair <- joined_POS_adj %>%
+  select(thing = lemma, adjective = lemma_source) %>%
+  filter(!is.na(adjective)) %>%    # Exclude missing adjectives
+  count(thing, adjective, sort = TRUE) %>%  # Count occurrences of each adj-thing pair
+  as.data.frame()
+
+plot_data <- adj_thing_pair %>%
+  mutate(label = paste(adjective, thing, sep = "-")) %>%  # Create labels like "serial-killer"
+  arrange(desc(n)) %>%  
+  slice_head(n = 15) %>% 
+  mutate(label = reorder(label, -n))
+
+ggplot(plot_data, aes(x=label, y=n)) +
+  geom_bar(stat="identity")+
+  labs(x="Adj-Thing Pair",y="Count")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Now serial-killer, human-skull and complete-stranger makes more sense.
+
+# Most Horrifying Stories
+
+Now we want to use sentiment analysis (NRC dictionary) to detect the most horrifying stories. Here I want to use the liwcalike function, so I can incorporate the length of the story.
+
+```{r}
+story_sen <- liwcalike(story_corpus,data_dictionary_NRC)
+
+head(story_sen,10)
+
+ggplot(story_sen)+
+  geom_histogram(aes(x=fear))+
+  theme_bw()
+
+quantile(story_sen$fear)
+```
+
+The 75% quantile of fear is 2.17. Let's look into stories with fear score equal to or larger than 2.
+
+```{r}
+fear_corpus <- story_corpus[which(story_sen$fear >= 2)]
+```
+
+Now we make a word cloud for top fear corpus.
+
+```{r}
+# remove punctuations, numbers, symbols, etc, and to lower case
+fear_token <- tokens(fear_corpus,
+                     remove_punct = T,
+                     remove_symbols = T,
+                     remove_numbers = T,
+                     remove_url = T,
+                     split_hyphens = F,
+                     include_docvars = T) %>%
+  tokens_tolower()
+# remove stopwords
+fear_token <- tokens_select(story_token,                 pattern=c(stopwords("en"),"t","s","re","im","2","wasn","didn","be","id","couldnt","fuck"),
+                  selection="remove")
+
+# lemmatization
+fear_token_lem <- tokens_replace(fear_token,
+                                 pattern=lexicon::hash_lemmas$token,
+                                 replacement = lexicon:: hash_lemmas$lemma)
+
+# create document feature matrix
+fearDfm <- fear_token_lem %>%
+  dfm()
+
+set.seed(1234)
+textplot_wordcloud(fearDfm, 
+                   min_count = 20,
+                   random_order = FALSE)
+```
+
+This looks good, but a bit messy. We want to reduce the information on the word cloud. So we trim the dfm to include only terms that appear in 50% or less of of the document.
+
+```{r}
+smaller_fearDfm <- dfm_trim(fearDfm, max_docfreq = .5, docfreq_type = "prop")
+
+# Make wordcloud
+set.seed(1234)
+textplot_wordcloud(smaller_fearDfm, 
+                   min_count = 20,
+                   max_words = 100,
+                   random_order = FALSE)
+```
+
+Now we see words like creature, shadow, darkness, whisper, etc. This looks more horror-story related.
+
+# Topic Modeling
+
+Now let's check out what are the topics in the horror stories. Let's look into the full corpus first.
+
+```{r}
+# full dfm (doesn't make sense)
+full_topic_5 <- stm(storyDfm, K = 5,
+                  verbose = FALSE, init.type = "Spectral")
+plot(full_topic_5,type="summary")
+
+full_topic_10 <- stm(storyDfm, K = 10,
+                  verbose = FALSE, init.type = "Spectral")
+plot(full_topic_10,type="summary")
+```
+
+The topics using full corpus doesn't make much sense. It's not horrifying at all. Let's look into the fear corpus then.
+
+```{r}
+fear_topic5 <- stm(fearDfm, K = 5,
+                       verbose = FALSE, init.type = "Spectral")
+plot(fear_topic5,type="summary")
+```
+
+```{r}
+fear_topic10 <- stm(fearDfm, K = 10,
+                       verbose = FALSE, init.type = "Spectral")
+plot(fear_topic10,type="summary")
+```
+
+Don't like this result either... Let's try the trimmed fear dfm then.
+
+```{r}
+small_fear_topic5 <- stm(smaller_fearDfm, K = 5,                       verbose = FALSE, init.type = "Spectral")
+plot(small_fear_topic5,type="summary")
+```
+
+Seems the top 1 topic: whisper, shadow, dark, is the most horrifying. Let's make a word cloud for the stories that contribute to this topic.
+
+```{r}
+#Get document-topic probabilities
+topic_probs <- small_fear_topic5$theta
+
+#Identify documents where Topic2 is the highest probability topic
+threshold <- 0.5  
+topic2_docs <- which(topic_probs[, 2] > threshold)
+
+#Subset the DFM to only include documents that contribute strongly to Topic2
+topic2_fearDfm <- smaller_fearDfm[topic2_docs, ]
+
+#Wordcloud
+set.seed(1234)
+textplot_wordcloud(topic2_fearDfm, 
+                   max_words = 100, 
+                   min_count = 20, 
+                   random_order = FALSE)
+
+```
